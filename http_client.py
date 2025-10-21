@@ -50,16 +50,62 @@ def fetch(url: str, method: str, headers: Optional[Dict[str, str]] = None) -> HT
 
     # Split host[:port] and path
     host_port, _, path = rest.partition("/")
-    host, port = (host_port, 80)
-    if ":" in host_port:
-        host, port_str = host_port.split(":", 1)
-        port = int(port_str)
+    
+    # Handle IPv6 addresses in URLs like [::1]:8080
+    if host_port.startswith('['):
+        # IPv6 address format: [host]:port or just [host]
+        if ']:' in host_port:
+            host_part, port_str = host_port.rsplit(']:', 1)
+            host = host_part[1:]  # Remove leading [
+            port = int(port_str)
+        else:
+            host = host_port[1:-1]  # Remove [ and ]
+            port = 80
+    else:
+        # IPv4 address or hostname
+        if ':' in host_port:
+            host, port_str = host_port.rsplit(':', 1)
+            port = int(port_str)
+        else:
+            host = host_port
+            port = 80
+    
     path = "/" + path  # ensure leading slash
 
-    # Open TCP connection
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # sock.settimeout(timeout)  # optional timeout if needed
-    sock.connect((host, port))
+   # Try to resolve the hostname and connect
+    # getaddrinfo returns results for both IPv6 and IPv4
+    sock = None
+    last_error = None
+
+    try:
+        # Get all possible addresses (IPv6 and IPv4)
+        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+
+        # Try each address until one works
+        for family, socktype, proto, canonname, sockaddr in addr_info:
+            try:
+                sock = socket.socket(family, socktype, proto)
+                # sock.settimeout(timeout)  # optional timeout if needed
+                print(f"Attempting connection to {sockaddr} using {'IPv6' if family == socket.AF_INET6 else 'IPv4'}")
+                sock.connect(sockaddr)
+                print(f"Connected successfully")
+                break
+            except socket.error as e:
+                if sock:
+                    sock.close()
+                sock = None
+                last_error = e
+                continue
+
+        if sock is None:
+            raise socket.error(f"Could not connect to {host}:{port} - {last_error}")
+
+    except socket.gaierror as e:
+        print(f"Failed to resolve {host}: {e}", file=sys.stderr)
+        sys.exit(EXIT_FAILURE)
+    except socket.error as e:
+        print(f"Connection failed: {e}", file=sys.stderr)
+        sys.exit(EXIT_FAILURE)
 
     # Build HTTP/1.0 request lines (server will close after response)
     lines = [
