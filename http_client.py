@@ -126,7 +126,7 @@ def parse_response(response: bytes) -> HTTPResponse:
 
 # ---- CLI: fetch URL, follow simple redirects, print to stdout/stderr, set exit code ----
 if __name__ == "__main__":
-    print("Running HTTP client...")
+    print("Running HTTP client...\n")
 
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <url>", file=sys.stderr)
