@@ -16,8 +16,6 @@ import socket
 import select
 from typing import Dict, Tuple, Optional
 
-# ----------------------------- Constants -------------------------------------
-
 HOST_V4 = "127.0.0.1"   # IPv4 loopback
 HOST_V6 = "::1"         # IPv6 loopback
 EXIT_SUCCESS = 0
@@ -29,8 +27,6 @@ DEFAULT_ENCODING = "utf-8"
 
 ALLOWED_METHOD = "GET"
 ALLOWED_HTML_EXTS = (".html", ".htm")
-
-# ----------------------------- Error Pages -----------------------------------
 
 BAD_REQUEST_BODY = b"""<!DOCTYPE html>
 <html lang="en">
@@ -55,8 +51,6 @@ FORBIDDEN_BODY = b"""<!DOCTYPE html>
   <head><meta charset="utf-8"><title>403 Forbidden</title></head>
   <body><h1>403 Forbidden</h1><p>You don't have permission to access this resource.</p></body>
 </html>"""
-
-# ------------------------------ Connection State -----------------------------
 class Connection:
     """
     State machine for a single client connection.
@@ -69,8 +63,6 @@ class Connection:
         self.response_buffer = b""
         self.headers_complete = False
         self.should_close = False
-
-# ------------------------------ Networking -----------------------------------
 
 def setup_server(port: int, backlog: int) -> socket.socket:
     """
@@ -102,8 +94,6 @@ def setup_server(port: int, backlog: int) -> socket.socket:
     server_socket.listen(backlog)
     print(f"[ok] Listening on IPv4 {HOST_V4}:{port}")
     return server_socket
-
-# ------------------------------ Request I/O ----------------------------------
 
 def read_http_request(conn: Connection) -> bool:
     """
@@ -191,8 +181,6 @@ def write_response(conn: Connection) -> bool:
 
     return False
 
-# -------------------------- HTTP Response Helpers ----------------------------
-
 def http_response(status_line: str, headers: Dict[str, str], body: bytes) -> bytes:
     """Build a raw HTTP response message."""
     head = status_line + "\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers.items()) + "\r\n"
@@ -256,8 +244,6 @@ def build_response(request: str) -> None:
     # Serve file (HTML only) / or 403/404
     return serve_file_if_allowed(rel_path)
 
-# ------------------------------ Routing --------------------------------------
-
 def safe_filesystem_path(url_path: str) -> str:
     """
     Convert a URL path to a safe relative filesystem path rooted at CWD.
@@ -289,8 +275,6 @@ def serve_file_if_allowed(rel_path: str) -> bytes:
         return forbidden_response()
 
     return not_found_response()
-
-# ------------------------------ Main Server ----------------------------------
 
 def run_server(port: int) -> None:
     """
@@ -386,8 +370,6 @@ def run_server(port: int) -> None:
 
         print("Server closed.")
         sys.exit(EXIT_SUCCESS)
-
-# --------------------------------- Entrypoint --------------------------------
 
 if __name__ == "__main__":
     print("Starting HTTP server...\n")
