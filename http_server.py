@@ -13,7 +13,8 @@ Tiny single-file HTTP 1.1 server for local testing.
 import os
 import sys
 import socket
-from typing import Dict, Tuple
+import select
+from typing import Dict, Tuple, Optional
 
 # ----------------------------- Constants -------------------------------------
 
@@ -21,9 +22,10 @@ HOST_V4 = "127.0.0.1"   # IPv4 loopback
 HOST_V6 = "::1"         # IPv6 loopback
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
-MAX_CONNECTIONS = 5
+MAX_BACKLOG = 5
 READ_CHUNK = 2048
 REQ_HEADER_LIMIT = 64 * 1024  # simple guardrail for header size DoS
+DEFAULT_ENCODING = "utf-8"
 
 ALLOWED_METHOD = "GET"
 ALLOWED_HTML_EXTS = (".html", ".htm")
@@ -54,12 +56,147 @@ FORBIDDEN_BODY = b"""<!DOCTYPE html>
   <body><h1>403 Forbidden</h1><p>You don't have permission to access this resource.</p></body>
 </html>"""
 
+# ------------------------------ Connection State -----------------------------
+class Connection:
+    """
+    State machine for a single client connection.
+    Tracks request buffer, response buffer, and connection state.
+    """
+    def __init__(self, socket: socket.socket, address):
+        self.socket = socket
+        self.address = address
+        self.request_buffer = b""
+        self.response_buffer = b""
+        self.headers_complete = False
+        self.should_close = False
+
+# ------------------------------ Networking -----------------------------------
+
+def setup_server(port: int, backlog: int) -> socket.socket:
+    """
+    Create a listening socket.
+    Tries IPv6 loopback (::1) with dual-stack (IPv4-mapped) when supported,
+    otherwise falls back to IPv4 loopback.
+    """
+    # Try IPv6 dual-stack first
+    try:
+        server_socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            # Some OSes forbid toggling this; ignore if unsupported.
+            server_socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except OSError as e:
+            print(f"[warn] IPV6_V6ONLY=0 not supported: {e}")
+
+        server_socket.bind((HOST_V6, port))
+        server_socket.listen(backlog)
+        print(f"[ok] Listening on IPv6 {HOST_V6}:{port} (dual-stack if supported)\n")
+        return server_socket
+    except OSError as e:
+        print(f"[warn] IPv6 bind failed: {e}. Falling back to IPv4...")
+
+    # Fallback: IPv4 only
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((HOST_V4, port))
+    server_socket.listen(backlog)
+    print(f"[ok] Listening on IPv4 {HOST_V4}:{port}")
+    return server_socket
+
+# ------------------------------ Request I/O ----------------------------------
+
+def read_http_request(conn: Connection) -> bool:
+    """
+    Non-blocking read of HTTP request data.
+    Returns True if headers are complete, False otherwise.
+    """
+    if conn.headers_complete:
+        return True
+
+    try:
+        chunk = conn.socket.recv(READ_CHUNK)
+        if not chunk:
+            # Connection closed by client
+            conn.should_close = True
+            return False
+
+        conn.request_buffer += chunk
+
+        # Check if we have complete headers
+        if b"\r\n\r\n" in conn.request_buffer:
+            conn.headers_complete = True
+            return True
+
+        # Check size limit
+        if len(conn.request_buffer) > REQ_HEADER_LIMIT:
+            # Request too large
+            conn.response_buffer = bad_request_response()
+            conn.should_close = True
+            return True
+
+    except socket.error as e:
+        # Would block or other error
+        if e.errno not in (socket.EWOULDBLOCK, socket.EAGAIN):
+            conn.should_close = True
+
+    return False
+
+def parse_request_line(line: str) -> Tuple[str, str, str]:
+    """
+    Parse: 'METHOD /path HTTP/1.1' -> (method, path, version).
+    Returns empty strings if malformed.
+    """
+    parts = line.split()
+    if len(parts) < 3:
+        return "", "", ""
+    return parts[0], parts[1], parts[2]
+
+def process_request(conn: Connection) -> None:
+    """
+    Process complete request headers and generate response.
+    """
+    if not conn.headers_complete:
+        return
+
+    # Parse request
+    request = conn.request_buffer.decode(DEFAULT_ENCODING, errors="replace")
+    first_line = request.split("\r\n", 1)[0]
+
+    print(f"[{conn.address}] Request: {first_line}")
+
+    # Generate response
+    conn.response_buffer = build_response(first_line)
+    conn.should_close = True  # HTTP/1.0 style - close after response
+
+def write_response(conn: Connection) -> bool:
+    """
+    Non-blocking write of response data.
+    Returns True if all data sent, False otherwise.
+    """
+    if not conn.response_buffer:
+        return True
+
+    try:
+        sent = conn.socket.send(conn.response_buffer)
+        conn.response_buffer = conn.response_buffer[sent:]
+
+        if not conn.response_buffer:
+            # All data sent
+            return True
+
+    except socket.error as e:
+        if e.errno not in (socket.EWOULDBLOCK, socket.EAGAIN):
+            conn.should_close = True
+            return True
+
+    return False
+
 # -------------------------- HTTP Response Helpers ----------------------------
 
 def http_response(status_line: str, headers: Dict[str, str], body: bytes) -> bytes:
     """Build a raw HTTP response message."""
     head = status_line + "\r\n" + "".join(f"{k}: {v}\r\n" for k, v in headers.items()) + "\r\n"
-    return head.encode("iso-8859-1") + body
+    return head.encode(DEFAULT_ENCODING) + body
 
 def bad_request_response(body: bytes = BAD_REQUEST_BODY) -> bytes:
     return http_response(
@@ -101,72 +238,23 @@ def ok_response(body: bytes) -> bytes:
         body,
     )
 
-# ------------------------------ Networking -----------------------------------
+def build_response(request: str) -> None:
+    """Generate HTTP response for a request."""
+    method, path, _version = parse_request_line(request)
+    if not method:
+        return bad_request_response()
 
-def make_listening_socket(port: int, backlog: int) -> socket.socket:
-    """
-    Create a listening socket.
-    Tries IPv6 loopback (::1) with dual-stack (IPv4-mapped) when supported,
-    otherwise falls back to IPv4 loopback.
-    """
-    # Try IPv6 dual-stack first
-    try:
-        s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            # Some OSes forbid toggling this; ignore if unsupported.
-            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-        except OSError as e:
-            print(f"[warn] IPV6_V6ONLY=0 not supported: {e}")
+    # Only allow GET
+    if method != ALLOWED_METHOD:
+        return method_not_allowed_response()
 
-        s.bind((HOST_V6, port))
-        s.listen(backlog)
-        print(f"[ok] Listening on IPv6 {HOST_V6}:{port} (dual-stack if supported)\n")
-        return s
-    except OSError as e:
-        print(f"[warn] IPv6 bind failed: {e}. Falling back to IPv4...")
+    # Resolve path safely
+    rel_path = safe_filesystem_path(path)
+    if not rel_path:
+        return not_found_response()
 
-    # Fallback: IPv4 only
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind((HOST_V4, port))
-    s.listen(backlog)
-    print(f"[ok] Listening on IPv4 {HOST_V4}:{port}")
-    return s
-
-# ------------------------------ Request I/O ----------------------------------
-
-def read_http_request(sock: socket.socket) -> Tuple[str, str]:
-    """
-    Read raw HTTP header bytes until CRLFCRLF and return:
-    (first_request_line, full_request_text).
-    """
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        chunk = sock.recv(READ_CHUNK)
-        if not chunk:
-            break
-        buf += chunk
-        if len(buf) > REQ_HEADER_LIMIT:
-            # Prevent unbounded growth on malicious/buggy clients.
-            return "", ""
-
-    if not buf:
-        return "", ""
-
-    text = buf.decode("utf-8", errors="replace")
-    first_line = text.split("\r\n", 1)[0]
-    return first_line, text
-
-def parse_request_line(line: str) -> Tuple[str, str, str]:
-    """
-    Parse: 'METHOD /path HTTP/1.1' -> (method, path, version).
-    Returns empty strings if malformed.
-    """
-    parts = line.split()
-    if len(parts) < 3:
-        return "", "", ""
-    return parts[0], parts[1], parts[2]
+    # Serve file (HTML only) / or 403/404
+    return serve_file_if_allowed(rel_path)
 
 # ------------------------------ Routing --------------------------------------
 
@@ -204,75 +292,115 @@ def serve_file_if_allowed(rel_path: str) -> bytes:
 
 # ------------------------------ Main Server ----------------------------------
 
-def handle_client(client_socket: socket.socket, client_address) -> None:
-    """Handle a single client connection lifecycle."""
-    print(f"Accepted connection from {client_address}")
-
-    # Read and parse request line
-    request_line, _full = read_http_request(client_socket)
-    if not request_line:
-        return  # ignore empty or oversized header
-
-    print(f"Received request: {request_line}")
-    method, path, _version = parse_request_line(request_line)
-    if not method:
-        client_socket.sendall(bad_request_response())
-        return
-
-    # Only allow GET
-    if method != ALLOWED_METHOD:
-        client_socket.sendall(method_not_allowed_response())
-        return
-
-    # Resolve path safely
-    rel_path = safe_filesystem_path(path)
-    if not rel_path:
-        client_socket.sendall(not_found_response())
-        return
-
-    # Serve file (HTML only) / or 403/404
-    client_socket.sendall(serve_file_if_allowed(rel_path))
-
 def run_server(port: int) -> None:
-    """Run the accept loop; Ctrl-C to stop."""
-    server_socket: socket.socket | None = None
+    """
+    Run the server using select() for I/O multiplexing.
+    Handles multiple concurrent connections without blocking.
+    """
+    server_socket: Optional[socket.socket] = None
+    connections: Dict[socket.socket, Connection] = {}
+
     try:
-        server_socket = make_listening_socket(port, MAX_CONNECTIONS)
+        server_socket = setup_server(port, MAX_BACKLOG)
+        server_socket.setblocking(False)  # Non-blocking mode
 
-        try:
-            while True:
-                client_socket, client_address = server_socket.accept()
-                # No threading: handle sequentially for simplicity.
-                with client_socket:
-                    handle_client(client_socket, client_address)
+        print("Server ready. Waiting for connections... (Ctrl-C to stop)\n")
 
-        except KeyboardInterrupt:
-            print("\nShutting down server gracefully...")
-            sys.exit(EXIT_SUCCESS)
+        while True:
+            # Build socket lists for select
+            read_sockets = [server_socket]
+            write_sockets = []
+
+            for sock, conn in connections.items():
+                if not conn.headers_complete or conn.request_buffer:
+                    read_sockets.append(sock)
+                if conn.response_buffer:
+                    write_sockets.append(sock)
+
+            try:
+                # Wait for I/O activity
+                readable, writable, _ = select.select(
+                    read_sockets, write_sockets, []
+                )
+            except select.error:
+                continue
+
+            # Handle new connections
+            if server_socket in readable:
+                try:
+                    client_socket, client_address = server_socket.accept()
+                    client_socket.setblocking(False)
+                    connections[client_socket] = Connection(client_socket, client_address)
+                    print(f"[+] New connection from {client_address}")
+                except socket.error:
+                    pass
+
+            # Handle readable client sockets
+            for sock in readable:
+                if sock != server_socket and sock in connections:
+                    conn = connections[sock]
+                    if read_http_request(conn):
+                        process_request(conn)
+
+            # Handle writable client sockets
+            for sock in writable:
+                if sock in connections:
+                    conn = connections[sock]
+                    if write_response(conn):
+                        if conn.should_close:
+                            # Response complete, close connection
+                            print(f"[-] Closing connection from {conn.address}")
+                            sock.close()
+                            del connections[sock]
+
+            # Clean up connections that should be closed
+            to_remove = []
+            for sock, conn in connections.items():
+                if conn.should_close and not conn.response_buffer:
+                    to_remove.append(sock)
+
+            for sock in to_remove:
+                print(f"[-] Removing connection from {connections[sock].address}")
+                sock.close()
+                del connections[sock]
+
+    except KeyboardInterrupt:
+        print("\n\nShutting down server gracefully...")
 
     except Exception as e:
-        print(f"[error] Server crashed: {e}")
+        print(f"[error] Server error: {e}")
 
     finally:
-        if server_socket is not None:
+        # Clean up all connections
+        for sock in connections:
+            try:
+                sock.close()
+            except:
+                pass
+
+        if server_socket:
             try:
                 server_socket.close()
-            except Exception:
+            except:
                 pass
+
         print("Server closed.")
+        sys.exit(EXIT_SUCCESS)
 
 # --------------------------------- Entrypoint --------------------------------
 
 if __name__ == "__main__":
-    print("Running HTTP server...")
+    print("Starting HTTP server...\n")
     if len(sys.argv) < 2:
         print(f"Usage: {sys.argv[0]} <port>", file=sys.stderr)
         sys.exit(EXIT_FAILURE)
 
     try:
         port = int(sys.argv[1].strip())
-    except ValueError:
-        print("Port must be an integer.", file=sys.stderr)
+        if not (1 <= port <= 65535):
+            raise ValueError("Port must be between 1 and 65535")
+    except ValueError as e:
+        print(f"Invalid port: {e}", file=sys.stderr)
         sys.exit(EXIT_FAILURE)
 
     run_server(port)

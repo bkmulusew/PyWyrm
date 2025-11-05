@@ -5,6 +5,7 @@ from typing import Dict, Optional
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 MAX_REDIRECTS = 10
+DEFAULT_ENCODING = "utf-8"
 
 class HTTPResponse:
     """
@@ -24,12 +25,14 @@ class HTTPResponse:
     @property
     def text(self) -> str:
         """
-        Decode body using charset from Content-Type if present; fallback to UTF-8.
+        Decode body using charset from Content-Type if present; fallback to DEFAULT_ENCODING.
         """
         ct = self.headers.get("content-type", "").lower()
-        enc = "utf-8"
-        if "charset=" in ct:
-            enc = ct.split("charset=", 1)[1].split(":", 1)[0].split(";", 1)[0].strip()
+        enc = (
+            ct.split("charset=", 1)[1].split(":", 1)[0].split(";", 1)[0].strip()
+            if "charset=" in ct
+            else DEFAULT_ENCODING
+        )
         return self.body.decode(enc, errors="replace")
 
 
@@ -50,7 +53,7 @@ def fetch(url: str, method: str, headers: Optional[Dict[str, str]] = None) -> HT
 
     # Split host[:port] and path
     host_port, _, path = rest.partition("/")
-    
+
     # Handle IPv6 addresses in URLs like [::1]:8080
     if host_port.startswith('['):
         # IPv6 address format: [host]:port or just [host]
@@ -69,10 +72,10 @@ def fetch(url: str, method: str, headers: Optional[Dict[str, str]] = None) -> HT
         else:
             host = host_port
             port = 80
-    
+
     path = "/" + path  # ensure leading slash
 
-   # Try to resolve the hostname and connect
+    # Try to resolve the hostname and connect
     # getaddrinfo returns results for both IPv6 and IPv4
     sock = None
     last_error = None
@@ -86,9 +89,9 @@ def fetch(url: str, method: str, headers: Optional[Dict[str, str]] = None) -> HT
             try:
                 sock = socket.socket(family, socktype, proto)
                 # sock.settimeout(timeout)  # optional timeout if needed
-                print(f"Attempting connection to {sockaddr} using {'IPv6' if family == socket.AF_INET6 else 'IPv4'}")
+                print(f"Attempting connection to {sockaddr} using {'IPv6' if family == socket.AF_INET6 else 'IPv4'}...")
                 sock.connect(sockaddr)
-                print(f"Connected successfully")
+                print(f"Connected successfully\n")
                 break
             except socket.error as e:
                 if sock:
@@ -119,7 +122,7 @@ def fetch(url: str, method: str, headers: Optional[Dict[str, str]] = None) -> HT
     request = "\r\n".join(lines) + "\r\n\r\n"
 
     # Send and read full response
-    sock.sendall(request.encode("utf-8"))
+    sock.sendall(request.encode(DEFAULT_ENCODING))
     resp_bytes = b""
     while True:
         chunk = sock.recv(4096)
@@ -144,13 +147,13 @@ def media_type_from_content_type(h: str) -> str:
 def parse_response(response: bytes) -> HTTPResponse:
     """
     Parse an HTTP/1.x response into status, reason, headers, and body.
-    Header bytes are decoded with ISO-8859-1 for a lossless mapping.
+    Header bytes are decoded with DEFAULT_ENCODING for a lossless mapping.
     """
     head, body = response.split(b"\r\n\r\n", 1)
     head_lines = head.split(b"\r\n")
 
     # Status line: e.g., b"HTTP/1.0 200 OK"
-    status_line = head_lines[0].decode("iso-8859-1")
+    status_line = head_lines[0].decode(DEFAULT_ENCODING)
     parts = status_line.split(" ", 2)
     if len(parts) < 2:
         print(f"Malformed status line: {status_line!r}", file=sys.stderr)
@@ -165,7 +168,7 @@ def parse_response(response: bytes) -> HTTPResponse:
         if not raw or b":" not in raw:
             continue
         name, val = raw.split(b":", 1)
-        headers[name.decode("iso-8859-1").strip().lower()] = val.decode("iso-8859-1").lstrip()
+        headers[name.decode(DEFAULT_ENCODING).strip().lower()] = val.decode(DEFAULT_ENCODING).lstrip()
 
     return HTTPResponse(status, reason, headers, body)
 
