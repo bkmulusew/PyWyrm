@@ -51,6 +51,7 @@ FORBIDDEN_BODY = b"""<!DOCTYPE html>
   <head><meta charset="utf-8"><title>403 Forbidden</title></head>
   <body><h1>403 Forbidden</h1><p>You don't have permission to access this resource.</p></body>
 </html>"""
+
 class Connection:
     """
     State machine for a single client connection.
